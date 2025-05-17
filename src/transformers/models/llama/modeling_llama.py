@@ -21,6 +21,7 @@ from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 import torch.utils.checkpoint
 from torch import nn
 
@@ -64,6 +65,14 @@ logger = logging.get_logger(__name__)
 
 _CHECKPOINT_FOR_DOC = "meta-llama/Llama-2-7b-hf"
 _CONFIG_FOR_DOC = "LlamaConfig"
+
+COLD_S = 14
+COLD_E = 34
+WARM_UP_INDEX = 8
+SIM_THRESHOLD = 0.97
+
+TOTAL_MLP = 0
+SKIP_MLP = 0
 
 
 class LlamaRMSNorm(nn.Module):
@@ -291,6 +300,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
+        self.layer_idx = layer_idx
 
         self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
 
@@ -301,6 +311,7 @@ class LlamaDecoderLayer(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        skip_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         past_key_value: Optional[Cache] = None,
@@ -310,6 +321,7 @@ class LlamaDecoderLayer(nn.Module):
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # necessary, but kept here for BC
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        global TOTAL_MLP, SKIP_MLP
         residual = hidden_states
 
         hidden_states = self.input_layernorm(hidden_states)
@@ -333,6 +345,15 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual + hidden_states
+
+        if COLD_S <= self.layer_idx < COLD_E:
+            mask = torch.logical_or(position_ids < WARM_UP_INDEX,
+                                    skip_states.logical_not()).unsqueeze(-1)
+            hidden_states = torch.where(mask, hidden_states, residual)
+            sim_scores = F.cosine_similarity(residual, hidden_states, dim=-1)
+            skip_states.logical_or_(sim_scores >= SIM_THRESHOLD)
+            SKIP_MLP += mask.logical_not().sum().item()
+        TOTAL_MLP += skip_states.numel()
 
         outputs = (hidden_states,)
         if output_attentions:
@@ -551,6 +572,8 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
 
+        skip_states = torch.zeros_like(input_ids, dtype=torch.bool,
+                                       device=input_ids.device)
         for decoder_layer in self.layers[: self.config.num_hidden_layers]:
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -559,6 +582,7 @@ class LlamaModel(LlamaPreTrainedModel):
                 layer_outputs = self._gradient_checkpointing_func(
                     partial(decoder_layer.__call__, **flash_attn_kwargs),
                     hidden_states,
+                    skip_states,
                     causal_mask,
                     position_ids,
                     past_key_values,
@@ -570,6 +594,7 @@ class LlamaModel(LlamaPreTrainedModel):
             else:
                 layer_outputs = decoder_layer(
                     hidden_states,
+                    skip_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
                     past_key_value=past_key_values,
@@ -590,6 +615,7 @@ class LlamaModel(LlamaPreTrainedModel):
         # add hidden states from the last decoder layer
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
+        print(SKIP_MLP / TOTAL_MLP)
 
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
